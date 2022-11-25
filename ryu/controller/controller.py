@@ -49,6 +49,9 @@ from ryu.controller.handler import HANDSHAKE_DISPATCHER, DEAD_DISPATCHER
 from ryu.lib.dpid import dpid_to_str
 from ryu.lib import ip
 
+from ryu.lib.packet import packet
+from ryu.lib.packet import ethernet 
+import queue
 LOG = logging.getLogger('ryu.controller.controller')
 
 DEFAULT_OFP_HOST = '0.0.0.0'
@@ -275,7 +278,9 @@ class Datapath(ofproto_protocol.ProtocolDesc):
 
     def __init__(self, socket, address):
         super(Datapath, self).__init__()
-
+        self.task_q = queue.PriorityQueue()
+        self.packinobject={}
+        self.queue_index=0
         self.socket = socket
         self.socket.setsockopt(IPPROTO_TCP, TCP_NODELAY, 1)
         self.socket.settimeout(CONF.socket_timeout)
@@ -284,7 +289,7 @@ class Datapath(ofproto_protocol.ProtocolDesc):
 
         # The limit is arbitrary. We need to limit queue size to
         # prevent it from eating memory up.
-        self.send_q = hub.Queue(16)
+        self.send_q = hub.Queue(200)
         self._send_q_sem = hub.BoundedSemaphore(self.send_q.maxsize)
 
         self.echo_request_interval = CONF.echo_request_interval
@@ -319,7 +324,28 @@ class Datapath(ofproto_protocol.ProtocolDesc):
         ev.state = state
         if self.ofp_brick is not None:
             self.ofp_brick.send_event_to_observers(ev, state)
+    def ev_queue_to_handle(self):
+        while True:
+            ev_index=self.task_q.get()
+           
+            ev=self.packinobject[ev_index[1]] 
+            
+            if self.ofp_brick is not None:
+                self.ofp_brick.send_event_to_observers(ev, self.state)
 
+                def dispatchers(x):
+                    return x.callers[ev.__class__].dispatchers
+
+                handlers = [handler for handler in
+                            self.ofp_brick.get_handlers(ev) if
+                            self.state in dispatchers(handler)]
+                for handler in handlers:
+                    handler(ev)
+                     
+            try:
+                del self.packinobject[ev_index[1]] 
+            except:
+                pass
     # Low level socket handling layer
     @_deactivate
     def _recv_loop(self):
@@ -362,18 +388,23 @@ class Datapath(ofproto_protocol.ProtocolDesc):
                     self, version, msg_type, msg_len, xid, buf[:msg_len])
                 # LOG.debug('queue msg %s cls %s', msg, msg.__class__)
                 if msg:
-                    ev = ofp_event.ofp_msg_to_ev(msg)
-                    if self.ofp_brick is not None:
-                        self.ofp_brick.send_event_to_observers(ev, self.state)
-
-                        def dispatchers(x):
-                            return x.callers[ev.__class__].dispatchers
-
-                        handlers = [handler for handler in
-                                    self.ofp_brick.get_handlers(ev) if
-                                    self.state in dispatchers(handler)]
-                        for handler in handlers:
-                            handler(ev)
+                    qos=1000
+                    try:
+                        ev = ofp_event.ofp_msg_to_ev(msg)
+                         
+                        OpELD_EtherType = 0x1105  
+                        msg = ev.msg
+                        
+                        pkt = packet.Packet(data=msg.data)
+                        pkt_ethernet = pkt.get_protocol(ethernet.ethernet)
+                        if pkt_ethernet:
+                            if pkt_ethernet.ethertype == OpELD_EtherType:
+                                qos=1
+                    except:
+                        pass
+                    self.task_q.put([qos, self.queue_index])
+                    self.packinobject[self.queue_index]=ev
+                    self.queue_index=self.queue_index+1
 
                 buf = buf[msg_len:]
                 buf_len = len(buf)
@@ -470,13 +501,14 @@ class Datapath(ofproto_protocol.ProtocolDesc):
         self.send_msg(hello)
 
         echo_thr = hub.spawn(self._echo_request_loop)
-
+        ev_queue_to_handle_thr = hub.spawn(self.ev_queue_to_handle)
         try:
             self._recv_loop()
         finally:
             hub.kill(send_thr)
             hub.kill(echo_thr)
-            hub.joinall([send_thr, echo_thr])
+            hub.kill(ev_queue_to_handle_thr)
+            hub.joinall([send_thr, echo_thr, ev_queue_to_handle_thr])
             self.is_active = False
 
     #
